@@ -177,9 +177,16 @@ async function generate(){
   for(let i=0;i<steps.length;i++){
     const st=steps[i];
     say(`Step ${i+1} of ${steps.length}: ${st.label||st.api}. A sleeping Space can take a few minutes to wake…`);
-    const data=JSON.parse(JSON.stringify(st.data||[]),(k,v)=>v==='$IMAGE'?fileData:v==='$PREV'?(out[0]||fileData):v);
-    try{out=await call(base,String(st.api).replace(/^\//,''),data)}
-    catch(e){if(!st.optional)throw e;out=[fileData]}
+    const api=String(st.api).replace(/^\//,'');
+    const prev=out[0]&&out[0].path?{path:out[0].path,meta:{_type:'gradio.FileData'}}:fileData; // path only, no url
+    const build=img=>JSON.parse(JSON.stringify(st.data||[]),(k,v)=>v==='$IMAGE'?fileData:v==='$PREV'?img:v);
+    try{out=await call(base,api,build(prev))}
+    catch(e){
+      if(st.optional){out=[fileData];continue}
+      // if the cleaned image was the problem, retry once with your original picture (not for GPU limits)
+      if(!JSON.stringify(st.data||[]).includes('$PREV')||/quota|exceeded|queue/i.test(e.message||''))throw e;
+      out=await call(base,api,build(fileData));
+    }
   }
   const item=out.find(x=>x&&typeof x==='object'&&/\.glb/i.test(x.url||x.path||''));
   if(!item)throw new Error('The last step finished, but no GLB file was in its output.');
