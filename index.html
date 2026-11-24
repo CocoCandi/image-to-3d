@@ -53,16 +53,17 @@ input[type=file]{display:none}
 <details id="conn">
   <summary>Model connection</summary>
   <label for="space">Hugging Face Space address
-    <input id="space" type="text" inputmode="url" autocapitalize="off" value="https://jeffreyxiang-trellis.hf.space">
+    <input id="space" type="text" inputmode="url" autocapitalize="off" value="https://microsoft-trellis-2.hf.space">
   </label>
-  <label for="steps">Steps (run in order; "$IMAGE" is your picture)
-    <textarea id="steps" rows="9" autocapitalize="off" spellcheck="false">[
- {"api":"start_session","label":"Starting"},
- {"api":"image_to_3d","label":"Building model","data":["$IMAGE",[],0,7.5,12,3,12,"stochastic"]},
- {"api":"extract_glb","label":"Making GLB","data":[0.95,1024]}
+  <label for="steps">Steps (run in order; "$IMAGE" is your picture, "$PREV" the last result)
+    <textarea id="steps" rows="10" autocapitalize="off" spellcheck="false">[
+ {"api":"start_session","label":"Starting","optional":true},
+ {"api":"preprocess_image","label":"Cleaning image","data":["$IMAGE"],"optional":true},
+ {"api":"image_to_3d","label":"Building model","data":["$PREV",0,"512",7.5,0.7,12,5.0,7.5,0.5,12,3.0,1.0,0.0,12,3.0]},
+ {"api":"extract_glb","label":"Making GLB","data":[300000,2048]}
 ]</textarea>
   </label>
-  <p class="note">These defaults match the original TRELLIS Space. Other Spaces use different step names and inputs. Free Spaces queue and have a small daily GPU limit.</p>
+  <p class="note">These defaults match the TRELLIS.2 Space. "512" is the resolution: fastest and lightest on your free GPU time (try "1024" for more detail). Other Spaces use different step names and inputs. Free Spaces queue and have a small daily GPU limit.</p>
 </details>
 
 <script type="importmap">
@@ -78,7 +79,7 @@ const stage=$('stage'),statusEl=$('status');
 const say=(t,err)=>{statusEl.textContent=t;statusEl.className=err?'err':''};
 
 // ---- saved settings (guarded: storage can be unavailable) ----
-const KEY='img3d-settings-2';
+const KEY='img3d-settings-3';
 const fields=['space','steps'];
 try{const s=JSON.parse(localStorage.getItem(KEY)||'{}');fields.forEach(f=>{if(s[f])$(f).value=s[f]})}catch(e){}
 const cfg=()=>Object.fromEntries(fields.map(f=>[f,$(f).value.trim()]));
@@ -141,10 +142,10 @@ $('dl').addEventListener('click',()=>{
 // ---- generate through a Gradio (Hugging Face) Space, in steps ----
 const sid=Math.random().toString(36).slice(2); // keeps all steps in one Space session
 async function call(base,api,data){
-  const r=await fetch(`${base}/gradio_api/call/${api}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data,session_hash:sid})});
+  const r=await fetch(`${base}/call/${api}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data,session_hash:sid})});
   if(!r.ok)throw new Error(`The Space rejected "${api}" (${r.status}). Check the step name and inputs.`);
   const {event_id}=await r.json();
-  const text=await (await fetch(`${base}/gradio_api/call/${api}/${event_id}`)).text();
+  const text=await (await fetch(`${base}/call/${api}/${event_id}`)).text();
   let ev='',out=null;
   for(const line of text.split('\n')){
     if(line.startsWith('event:'))ev=line.slice(6).trim();
@@ -158,12 +159,17 @@ async function call(base,api,data){
   return out;
 }
 async function generate(){
-  const c=cfg(),base=c.space.replace(/\/$/,'');
+  const c=cfg(),root=c.space.replace(/\/$/,'');
+  say('Connecting to the Space…');
+  let cr;try{cr=await fetch(root+'/config')}catch(e){throw new Error('Could not reach that address. Check the Space address and your connection.')}
+  if(!cr.ok)throw new Error('No Space found at that address ('+cr.status+'). Open it in Safari to check it exists and is running.');
+  let prefix='';try{prefix=(await cr.json()).api_prefix||''}catch(e){}
+  const base=root+prefix; // older Gradio uses no prefix, newer uses /gradio_api
   let steps;
   try{steps=JSON.parse(c.steps);if(!Array.isArray(steps))throw 0}catch(e){throw new Error('The Steps field is not a valid JSON list.')}
   say('Uploading image…');
   const fd=new FormData();fd.append('files',image);
-  const up=await fetch(base+'/gradio_api/upload',{method:'POST',body:fd});
+  const up=await fetch(base+'/upload',{method:'POST',body:fd});
   if(!up.ok)throw new Error('Upload failed ('+up.status+'). Check the Space address and that the Space is running.');
   const [path]=await up.json();
   const fileData={path,meta:{_type:'gradio.FileData'}};
@@ -171,13 +177,14 @@ async function generate(){
   for(let i=0;i<steps.length;i++){
     const st=steps[i];
     say(`Step ${i+1} of ${steps.length}: ${st.label||st.api}. A sleeping Space can take a few minutes to wake…`);
-    const data=JSON.parse(JSON.stringify(st.data||[]),(k,v)=>v==='$IMAGE'?fileData:v);
-    out=await call(base,String(st.api).replace(/^\//,''),data);
+    const data=JSON.parse(JSON.stringify(st.data||[]),(k,v)=>v==='$IMAGE'?fileData:v==='$PREV'?(out[0]||fileData):v);
+    try{out=await call(base,String(st.api).replace(/^\//,''),data)}
+    catch(e){if(!st.optional)throw e;out=[fileData]}
   }
   const item=out.find(x=>x&&typeof x==='object'&&/\.glb/i.test(x.url||x.path||''));
   if(!item)throw new Error('The last step finished, but no GLB file was in its output.');
   say('Downloading model…');
-  const file=await fetch(item.url||`${base}/gradio_api/file=${item.path}`);
+  const file=await fetch(item.url||`${base}/file=${item.path}`);
   show(await file.arrayBuffer());
   say('Done. Drag to rotate, pinch to zoom.');
 }
