@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Image to 3D</title>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--stage:#d6d5d0;--paper:#f4f3ef;--ink:#1c1f24;--mute:#666b73;--accent:#2742ff;--on:#fff;--line:#c9c8c2;--err:#b3261e;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--stage:#2a2c31;--paper:#17181b;--ink:#ecebe7;--mute:#9a9ea6;--accent:#8a99ff;--on:#10121a;--line:#34363c;--err:#ff8a80}}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0;font:400 16px/1.5 Sora,system-ui,sans-serif;color:var(--ink);background:var(--paper);max-width:560px;margin-inline:auto;padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom))}
+h1{font-size:22px;line-height:1.2;margin:4px 0 14px;font-weight:700}
+#stage{position:relative;aspect-ratio:1/1;background:var(--stage);border-radius:14px;overflow:hidden;touch-action:none}
+#stage canvas{width:100%;height:100%;display:block}
+#empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--mute);font-size:15px}
+#stage.has #empty{display:none}
+.row{display:flex;gap:10px;margin-top:12px}
+button,.btn{flex:1;font:600 15px Sora,system-ui,sans-serif;padding:13px 14px;border-radius:10px;border:1.5px solid var(--ink);background:transparent;color:var(--ink);text-align:center;cursor:pointer}
+button.main{background:var(--accent);border-color:var(--accent);color:var(--on)}
+button:disabled{opacity:.4;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+#thumb{display:none;width:100%;max-height:140px;object-fit:contain;margin-top:12px;border-radius:10px;background:var(--stage)}
+#status{min-height:1.5em;margin:12px 0 0;color:var(--mute);font-size:14px}
+#status.err{color:var(--err)}
+details{margin-top:16px;border-top:1px solid var(--line);padding-top:12px}
+summary{cursor:pointer;font-weight:600;font-size:15px}
+label{display:block;margin-top:12px;font-size:13px;color:var(--mute)}
+input[type=text],textarea{width:100%;margin-top:4px;padding:10px;border:1.5px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);font:14px ui-monospace,Menlo,monospace}
+p.note{font-size:13px;color:var(--mute);margin:10px 0 0}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<h1>Image to 3D</h1>
+
+<div id="stage"><div id="empty">Your model appears here.<br>Choose an image, then tap Make 3D model.</div></div>
+<img id="thumb" alt="Selected image preview">
+
+<div class="row">
+  <label class="btn" for="pick" style="margin:0;color:var(--ink);font-size:15px">Choose image</label>
+  <input id="pick" type="file" accept="image/*">
+  <button id="go" class="main" disabled>Make 3D model</button>
+</div>
+<div class="row">
+  <button id="dl" disabled>Download GLB</button>
+  <label class="btn" for="glb" style="margin:0;color:var(--ink);font-size:15px">Preview a GLB file</label>
+  <input id="glb" type="file" accept=".glb,model/gltf-binary">
+</div>
+<p id="status" role="status" aria-live="polite"></p>
+
+<details id="conn">
+  <summary>Model connection</summary>
+  <label for="space">Hugging Face Space address
+    <input id="space" type="text" inputmode="url" autocapitalize="off" value="https://jeffreyxiang-trellis.hf.space">
+  </label>
+  <label for="steps">Steps (run in order; "$IMAGE" is your picture)
+    <textarea id="steps" rows="9" autocapitalize="off" spellcheck="false">[
+ {"api":"start_session","label":"Starting"},
+ {"api":"image_to_3d","label":"Building model","data":["$IMAGE",[],0,7.5,12,3,12,"stochastic"]},
+ {"api":"extract_glb","label":"Making GLB","data":[0.95,1024]}
+]</textarea>
+  </label>
+  <p class="note">These defaults match the original TRELLIS Space. Other Spaces use different step names and inputs. Free Spaces queue and have a small daily GPU limit.</p>
+</details>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+const $=id=>document.getElementById(id);
+const stage=$('stage'),statusEl=$('status');
+const say=(t,err)=>{statusEl.textContent=t;statusEl.className=err?'err':''};
+
+// ---- saved settings (guarded: storage can be unavailable) ----
+const KEY='img3d-settings-2';
+const fields=['space','steps'];
+try{const s=JSON.parse(localStorage.getItem(KEY)||'{}');fields.forEach(f=>{if(s[f])$(f).value=s[f]})}catch(e){}
+const cfg=()=>Object.fromEntries(fields.map(f=>[f,$(f).value.trim()]));
+fields.forEach(f=>$(f).addEventListener('change',()=>{try{localStorage.setItem(KEY,JSON.stringify(cfg()))}catch(e){}refresh()}));
+if(!$('space').value)$('conn').open=true;
+
+// ---- 3D viewer ----
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+stage.appendChild(renderer.domElement);
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(40,1,.01,1000);
+camera.position.set(1.6,1.1,2.4);
+scene.add(new THREE.HemisphereLight(0xffffff,0x888880,1.6));
+const sun=new THREE.DirectionalLight(0xffffff,2.2);sun.position.set(3,5,4);scene.add(sun);
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true;
+const calm=matchMedia('(prefers-reduced-motion: reduce)').matches;
+controls.autoRotate=!calm;controls.autoRotateSpeed=1.2;
+controls.addEventListener('start',()=>{controls.autoRotate=false});
+new ResizeObserver(()=>{const w=stage.clientWidth,h=stage.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}).observe(stage);
+renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera)});
+
+let current=null,glbBlob=null;
+function show(buf){
+  new GLTFLoader().parse(buf,'',g=>{
+    if(current)scene.remove(current);
+    current=g.scene;
+    const box=new THREE.Box3().setFromObject(current);
+    const size=box.getSize(new THREE.Vector3()),c=box.getCenter(new THREE.Vector3());
+    const s=1.6/(Math.max(size.x,size.y,size.z)||1);
+    current.scale.setScalar(s);current.position.copy(c.multiplyScalar(-s));
+    scene.add(current);
+    controls.target.set(0,0,0);controls.autoRotate=!calm;
+    stage.classList.add('has');
+    glbBlob=new Blob([buf],{type:'model/gltf-binary'});
+    $('dl').disabled=false;
+  },()=>say('That file could not be read as a GLB model.',true));
+}
+
+// ---- inputs ----
+let image=null;
+const refresh=()=>{$('go').disabled=!(image&&cfg().space)};
+$('pick').addEventListener('change',e=>{
+  image=e.target.files[0]||null;
+  const t=$('thumb');
+  if(image){t.src=URL.createObjectURL(image);t.style.display='block';say(cfg().space?'Ready. Tap Make 3D model.':'Add a Space address under Model connection first.')}
+  refresh();
+});
+$('glb').addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f)return;
+  say('Loading preview…');show(await f.arrayBuffer());say('');
+});
+$('dl').addEventListener('click',()=>{
+  if(!glbBlob)return;
+  const a=document.createElement('a');a.href=URL.createObjectURL(glbBlob);a.download='model.glb';a.click();
+});
+
+// ---- generate through a Gradio (Hugging Face) Space, in steps ----
+const sid=Math.random().toString(36).slice(2); // keeps all steps in one Space session
+async function call(base,api,data){
+  const r=await fetch(`${base}/gradio_api/call/${api}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data,session_hash:sid})});
+  if(!r.ok)throw new Error(`The Space rejected "${api}" (${r.status}). Check the step name and inputs.`);
+  const {event_id}=await r.json();
+  const text=await (await fetch(`${base}/gradio_api/call/${api}/${event_id}`)).text();
+  let ev='',out=null;
+  for(const line of text.split('\n')){
+    if(line.startsWith('event:'))ev=line.slice(6).trim();
+    else if(line.startsWith('data:')){
+      const d=line.slice(5).trim();
+      if(ev==='error')throw new Error('The Space reported an error'+(d&&d!=='null'?': '+d.replace(/^"|"$/g,''):'. It may be out of free GPU time.'));
+      if(ev==='complete')out=JSON.parse(d);
+    }
+  }
+  if(!out)throw new Error(`No result came back from "${api}".`);
+  return out;
+}
+async function generate(){
+  const c=cfg(),base=c.space.replace(/\/$/,'');
+  let steps;
+  try{steps=JSON.parse(c.steps);if(!Array.isArray(steps))throw 0}catch(e){throw new Error('The Steps field is not a valid JSON list.')}
+  say('Uploading image…');
+  const fd=new FormData();fd.append('files',image);
+  const up=await fetch(base+'/gradio_api/upload',{method:'POST',body:fd});
+  if(!up.ok)throw new Error('Upload failed ('+up.status+'). Check the Space address and that the Space is running.');
+  const [path]=await up.json();
+  const fileData={path,meta:{_type:'gradio.FileData'}};
+  let out=[];
+  for(let i=0;i<steps.length;i++){
+    const st=steps[i];
+    say(`Step ${i+1} of ${steps.length}: ${st.label||st.api}. A sleeping Space can take a few minutes to wake…`);
+    const data=JSON.parse(JSON.stringify(st.data||[]),(k,v)=>v==='$IMAGE'?fileData:v);
+    out=await call(base,String(st.api).replace(/^\//,''),data);
+  }
+  const item=out.find(x=>x&&typeof x==='object'&&/\.glb/i.test(x.url||x.path||''));
+  if(!item)throw new Error('The last step finished, but no GLB file was in its output.');
+  say('Downloading model…');
+  const file=await fetch(item.url||`${base}/gradio_api/file=${item.path}`);
+  show(await file.arrayBuffer());
+  say('Done. Drag to rotate, pinch to zoom.');
+}
+$('go').addEventListener('click',async()=>{
+  $('go').disabled=true;
+  try{await generate()}catch(e){say(e.message||'Something went wrong.',true)}
+  refresh();
+});
+</script>
+</body>
+</html>
